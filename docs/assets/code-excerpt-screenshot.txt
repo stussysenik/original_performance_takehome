@@ -1,0 +1,85 @@
+Repository: original_performance_takehome
+Generated: 2026-03-03
+
+Source: perf_takehome.py
+
+"""
+# Anthropic's Original Performance Engineering Take-home (Release version)
+Copyright Anthropic PBC 2026. Permission is granted to modify and use, but not
+to publish or redistribute your solutions so it's hard to find spoilers.
+# Task
+- Optimize the kernel (in KernelBuilder.build_kernel) as much as possible in the
+  available time, as measured by test_kernel_cycles on a frozen separate copy
+  of the simulator.
+Validate your results using `python tests/submission_tests.py` without modifying
+anything in the tests/ folder.
+We recommend you look through problem.py next.
+"""
+from collections import defaultdict
+import random
+import unittest
+from problem import (
+    Engine,
+    DebugInfo,
+    SLOT_LIMITS,
+    VLEN,
+    N_CORES,
+    SCRATCH_SIZE,
+    Machine,
+    Tree,
+    Input,
+    HASH_STAGES,
+    reference_kernel,
+    build_mem_image,
+    reference_kernel2,
+)
+class KernelBuilder:
+    def __init__(self):
+        self.instrs = []
+        self.scratch = {}
+        self.scratch_debug = {}
+        self.scratch_ptr = 0
+        self.const_map = {}
+    def debug_info(self):
+        return DebugInfo(scratch_map=self.scratch_debug)
+    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+        # Simple slot packing that just uses one slot per instruction bundle
+        instrs = []
+        for engine, slot in slots:
+            instrs.append({engine: [slot]})
+        return instrs
+    def add(self, engine, slot):
+        self.instrs.append({engine: [slot]})
+    def alloc_scratch(self, name=None, length=1):
+        addr = self.scratch_ptr
+        if name is not None:
+            self.scratch[name] = addr
+            self.scratch_debug[addr] = (name, length)
+        self.scratch_ptr += length
+        assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
+        return addr
+    def scratch_const(self, val, name=None):
+        if val not in self.const_map:
+            addr = self.alloc_scratch(name)
+            self.add("load", ("const", addr, val))
+            self.const_map[val] = addr
+        return self.const_map[val]
+    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
+        slots = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
+            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
+            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
+            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+        return slots
+    def build_kernel(
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+    ):
+        """
+        Like reference_kernel2 but building actual instructions.
+        Scalar implementation using only scalar ALU and load/store.
+        """
+        tmp1 = self.alloc_scratch("tmp1")
+        tmp2 = self.alloc_scratch("tmp2")
+        tmp3 = self.alloc_scratch("tmp3")
+        # Scratch space addresses
