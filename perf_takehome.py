@@ -23,6 +23,7 @@ import unittest
 from problem import (
     Engine,
     DebugInfo,
+    cdiv,
     SLOT_LIMITS,
     VLEN,
     N_CORES,
@@ -35,6 +36,43 @@ from problem import (
     build_mem_image,
     reference_kernel2,
 )
+
+
+class _Bundler:
+    """Greedy VLIW scheduler: packs dependency-safe slots into cycle bundles.
+
+    Scratch writes land only at the end of a cycle, so a slot that reads an
+    address written earlier in the same bundle must wait for the next bundle.
+    """
+
+    def __init__(self, limits):
+        self.limits = limits
+        self.bundles = []
+        self.cur = {}
+        self.cur_writes = set()
+        self.count = {}
+
+    def add(self, engine, slot, reads=(), writes=()):
+        if any(a in self.cur_writes for a in reads) or any(
+            a in self.cur_writes for a in writes
+        ):
+            self.flush()
+        if self.count.get(engine, 0) >= self.limits[engine]:
+            self.flush()
+        self.cur.setdefault(engine, []).append(slot)
+        self.count[engine] = self.count.get(engine, 0) + 1
+        self.cur_writes.update(writes)
+
+    def flush(self):
+        if self.cur:
+            self.bundles.append(self.cur)
+        self.cur = {}
+        self.cur_writes = set()
+        self.count = {}
+
+    def result(self):
+        self.flush()
+        return self.bundles
 
 
 class KernelBuilder:
@@ -88,90 +126,187 @@ class KernelBuilder:
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
+        """Vectorized SIMD + VLIW kernel with a software-pipelined gather.
+
+        Each group owns VLEN lanes kept in scratch across all rounds. Node values
+        are gathered with scalar loads (2/cycle); while one group gathers, the
+        hash/index chains of other groups occupy the 6 valu slots. Three hash
+        stages fold to multiply-add: (a + c) + (a << k) == a * (1<<k + 1) + c.
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
-        """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        b = _Bundler(SLOT_LIMITS)
+        vrange = lambda a: tuple(range(a, a + VLEN))
+        n_groups = cdiv(batch_size, VLEN)
+        forest_p = 7
+        idx_p = forest_p + n_nodes
+        val_p = idx_p + batch_size
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        def vec(name):
+            return self.alloc_scratch(name, VLEN)
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+        def scalar(name):
+            return self.alloc_scratch(name, 1)
 
-        body = []  # array of slots
+        def const_vec(value, name):
+            s = scalar(name + "_s")
+            b.add("load", ("const", s, value), (), (s,))
+            v = vec(name)
+            b.add("valu", ("vbroadcast", v, s), (s,), vrange(v))
+            return v
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        one = const_vec(1, "one")
+        nn = const_vec(n_nodes, "nn")
+        fp = const_vec(forest_p, "fp")
+        m1 = const_vec(4097, "m1")
+        m3 = const_vec(33, "m3")
+        m5 = const_vec(9, "m5")
+        c1 = const_vec(0x7ED55D16, "c1")
+        c2 = const_vec(0xC761C23C, "c2")
+        c3 = const_vec(0x165667B1, "c3")
+        c4 = const_vec(0xD3A2646C, "c4")
+        c5 = const_vec(0xFD7046C5, "c5")
+        c6 = const_vec(0xB55A4F09, "c6")
+        sh19 = const_vec(19, "sh19")
+        sh9 = const_vec(9, "sh9")
+        sh16 = const_vec(16, "sh16")
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+        idx_v = [vec(f"idx{g}") for g in range(n_groups)]
+        val_v = [vec(f"val{g}") for g in range(n_groups)]
+        x = [vec(f"x{g}") for g in range(n_groups)]
+        t = [vec(f"t{g}") for g in range(n_groups)]
+        addr = [vec(f"addr{g}") for g in range(n_groups)]
+        maddr = [scalar(f"m{g}") for g in range(n_groups)]
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+        # Load the batch into scratch vectors.
+        for g in range(n_groups):
+            b.add("load", ("const", maddr[g], idx_p + g * VLEN), (), (maddr[g],))
+        for g in range(n_groups):
+            b.add("load", ("vload", idx_v[g], maddr[g]), (maddr[g],), vrange(idx_v[g]))
+        for g in range(n_groups):
+            b.add("load", ("const", maddr[g], val_p + g * VLEN), (), (maddr[g],))
+        for g in range(n_groups):
+            b.add("load", ("vload", val_v[g], maddr[g]), (maddr[g],), vrange(val_v[g]))
+
+        # Matches the reference kernel's first yield.
+        b.add("flow", ("pause",))
+
+        def hash_op(g, s):
+            """Emit one of the 19 sequential hash/index vector ops for group g."""
+            iv, vv, xx, tt = idx_v[g], val_v[g], x[g], t[g]
+            if s == 0:
+                slot = ("^", xx, vv, tt)
+                reads, writes = vrange(vv) + vrange(tt), vrange(xx)
+            elif s == 1:
+                slot = ("multiply_add", xx, xx, m1, c1)
+                reads, writes = vrange(xx) + vrange(m1) + vrange(c1), vrange(xx)
+            elif s == 2:
+                slot = (">>", tt, xx, sh19)
+                reads, writes = vrange(xx) + vrange(sh19), vrange(tt)
+            elif s == 3:
+                slot = ("^", xx, xx, tt)
+                reads, writes = vrange(xx) + vrange(tt), vrange(xx)
+            elif s == 4:
+                slot = ("^", xx, xx, c2)
+                reads, writes = vrange(xx) + vrange(c2), vrange(xx)
+            elif s == 5:
+                slot = ("multiply_add", xx, xx, m3, c3)
+                reads, writes = vrange(xx) + vrange(m3) + vrange(c3), vrange(xx)
+            elif s == 6:
+                slot = ("+", tt, xx, c4)
+                reads, writes = vrange(xx) + vrange(c4), vrange(tt)
+            elif s == 7:
+                slot = ("<<", xx, xx, sh9)
+                reads, writes = vrange(xx) + vrange(sh9), vrange(xx)
+            elif s == 8:
+                slot = ("^", xx, xx, tt)
+                reads, writes = vrange(xx) + vrange(tt), vrange(xx)
+            elif s == 9:
+                slot = ("multiply_add", xx, xx, m5, c5)
+                reads, writes = vrange(xx) + vrange(m5) + vrange(c5), vrange(xx)
+            elif s == 10:
+                slot = (">>", tt, xx, sh16)
+                reads, writes = vrange(xx) + vrange(sh16), vrange(tt)
+            elif s == 11:
+                slot = ("^", xx, xx, tt)
+                reads, writes = vrange(xx) + vrange(tt), vrange(xx)
+            elif s == 12:
+                slot = ("^", vv, xx, c6)
+                reads, writes = vrange(xx) + vrange(c6), vrange(vv)
+            elif s == 13:
+                slot = ("&", tt, vv, one)
+                reads, writes = vrange(vv) + vrange(one), vrange(tt)
+            elif s == 14:
+                slot = ("<<", xx, iv, one)
+                reads, writes = vrange(iv) + vrange(one), vrange(xx)
+            elif s == 15:
+                slot = ("+", xx, xx, tt)
+                reads, writes = vrange(xx) + vrange(tt), vrange(xx)
+            elif s == 16:
+                slot = ("+", iv, xx, one)
+                reads, writes = vrange(xx) + vrange(one), vrange(iv)
+            elif s == 17:
+                slot = ("<", tt, iv, nn)
+                reads, writes = vrange(iv) + vrange(nn), vrange(tt)
+            else:
+                slot = ("*", iv, iv, tt)
+                reads, writes = vrange(iv) + vrange(tt), vrange(iv)
+            b.add("valu", slot, reads, writes)
+
+        # One gather every 4 cycles (8 loads, 2/cycle); hash chains of finished
+        # groups fill the valu slots in the same cycles.
+        total_gathers = n_groups * rounds
+        gather_seq = 0
+        load_j = 0
+        stage = [-1] * n_groups
+        group_round = [0] * n_groups
+        pending = []
+        done = 0
+        b.add("valu", ("+", addr[0], idx_v[0], fp), vrange(idx_v[0]) + vrange(fp), vrange(addr[0]))
+
+        while done < n_groups:
+            for g in pending:
+                stage[g] = 0
+            pending.clear()
+
+            if gather_seq < total_gathers:
+                g = gather_seq % n_groups
+                for jj in (0, 1):
+                    j = load_j + jj
+                    b.add("load", ("load", t[g] + j, addr[g] + j),
+                          (addr[g] + j,), (t[g] + j,))
+                load_j += 2
+                if load_j == VLEN:
+                    load_j = 0
+                    pending.append(g)
+                    gather_seq += 1
+                    if gather_seq < total_gathers:
+                        ng = gather_seq % n_groups
+                        b.add("valu", ("+", addr[ng], idx_v[ng], fp),
+                              vrange(idx_v[ng]) + vrange(fp), vrange(addr[ng]))
+
+            for gg in range(n_groups):
+                s = stage[gg]
+                if s >= 0:
+                    hash_op(gg, s)
+                    stage[gg] = s + 1
+                    if stage[gg] == 19:
+                        stage[gg] = -1
+                        group_round[gg] += 1
+                        if group_round[gg] == rounds:
+                            done += 1
+
+        # Write the batch back out.
+        for g in range(n_groups):
+            b.add("load", ("const", maddr[g], idx_p + g * VLEN), (), (maddr[g],))
+        for g in range(n_groups):
+            b.add("store", ("vstore", maddr[g], idx_v[g]), (maddr[g],) + vrange(idx_v[g]))
+        for g in range(n_groups):
+            b.add("load", ("const", maddr[g], val_p + g * VLEN), (), (maddr[g],))
+        for g in range(n_groups):
+            b.add("store", ("vstore", maddr[g], val_v[g]), (maddr[g],) + vrange(val_v[g]))
+
+        # Matches the reference kernel's final yield.
+        b.add("flow", ("pause",))
+        self.instrs = b.result()
 
 BASELINE = 147734
 
