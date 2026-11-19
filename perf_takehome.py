@@ -155,9 +155,7 @@ class KernelBuilder:
 
         one = const_vec(1, "one")
         two = const_vec(2, "two")
-        nn = const_vec(n_nodes, "nn")
-        all_ones = const_vec(0xFFFFFFFF, "all_ones")
-        zero = const_vec(0, "zero")
+        bias_v = const_vec((1 - forest_p) % (2**32), "bias")
         fp = const_vec(forest_p, "fp")
         m1 = const_vec(4097, "m1")
         m3 = const_vec(33, "m3")
@@ -172,18 +170,47 @@ class KernelBuilder:
         sh9 = const_vec(9, "sh9")
         sh16 = const_vec(16, "sh16")
 
+        fp_s = scalar("fp_s")
+        b.add("load", ("const", fp_s, forest_p), (), (fp_s,))
+        root_s = scalar("root_s")
+        b.add("load", ("load", root_s, fp_s), (fp_s,), (root_s,))
+        root_v = vec("root_v")
+        b.add("valu", ("vbroadcast", root_v, root_s), (root_s,), vrange(root_v))
+
+        # Rounds 1 and 12 have idx in {1,2}. Node value is linear in the
+        # absolute address a in {fp+1,fp+2}: node = diff*a + C (mod 2**32).
+        # One valu multiply_add per group replaces 8 scalar gathers.
+        a1_s = scalar("a1_s")
+        a2_s = scalar("a2_s")
+        b.add("load", ("const", a1_s, forest_p + 1), (), (a1_s,))
+        b.add("load", ("const", a2_s, forest_p + 2), (), (a2_s,))
+        n1_s, n2_s = scalar("n1_s"), scalar("n2_s")
+        b.add("load", ("load", n1_s, a1_s), (a1_s,), (n1_s,))
+        b.add("load", ("load", n2_s, a2_s), (a2_s,), (n2_s,))
+        diff_s = scalar("diff_s")
+        b.add("alu", ("-", diff_s, n2_s, n1_s), (n1_s, n2_s), (diff_s,))
+        prod_s, C_s = scalar("prod_s"), scalar("C_s")
+        b.add("alu", ("*", prod_s, diff_s, a1_s), (diff_s, a1_s), (prod_s,))
+        b.add("alu", ("-", C_s, n1_s, prod_s), (n1_s, prod_s), (C_s,))
+        diff_v = vec("diff_v")
+        C_v = vec("C_v")
+        b.add("valu", ("vbroadcast", diff_v, diff_s), (diff_s,), vrange(diff_v))
+        b.add("valu", ("vbroadcast", C_v, C_s), (C_s,), vrange(C_v))
+
         idx_v = [vec(f"idx{g}") for g in range(n_groups)]
         val_v = [vec(f"val{g}") for g in range(n_groups)]
         x = [vec(f"x{g}") for g in range(n_groups)]
         t = [vec(f"t{g}") for g in range(n_groups)]
-        addr = [vec(f"addr{g}") for g in range(n_groups)]
         maddr = [scalar(f"m{g}") for g in range(n_groups)]
 
-        # Load the batch into scratch vectors.
+        # Load the batch into scratch vectors. idx_v holds absolute addresses.
         for g in range(n_groups):
             b.add("load", ("const", maddr[g], idx_p + g * VLEN), (), (maddr[g],))
         for g in range(n_groups):
             b.add("load", ("vload", idx_v[g], maddr[g]), (maddr[g],), vrange(idx_v[g]))
+        for g in range(n_groups):
+            b.add("valu", ("+", idx_v[g], idx_v[g], fp),
+                  vrange(idx_v[g]) + vrange(fp), vrange(idx_v[g]))
         for g in range(n_groups):
             b.add("load", ("const", maddr[g], val_p + g * VLEN), (), (maddr[g],))
         for g in range(n_groups):
@@ -192,12 +219,13 @@ class KernelBuilder:
         # Matches the reference kernel's first yield.
         b.add("flow", ("pause",))
 
-        def hash_op(g, s):
-            """Emit one of the 19 sequential hash/index vector ops for group g."""
+        def hash_op(g, s, rnd):
+            """Emit one of the 17 sequential hash/index vector ops for group g."""
             iv, vv, xx, tt = idx_v[g], val_v[g], x[g], t[g]
             if s == 0:
-                slot = ("^", xx, vv, tt)
-                reads, writes = vrange(vv) + vrange(tt), vrange(xx)
+                src = root_v if rnd % (forest_height + 1) == 0 else tt
+                slot = ("^", xx, vv, src)
+                reads, writes = vrange(vv) + vrange(src), vrange(xx)
             elif s == 1:
                 slot = ("multiply_add", xx, xx, m1, c1)
                 reads, writes = vrange(xx) + vrange(m1) + vrange(c1), vrange(xx)
@@ -238,19 +266,18 @@ class KernelBuilder:
                 slot = ("&", xx, vv, one)
                 reads, writes = vrange(vv) + vrange(one), vrange(xx)
             elif s == 14:
-                slot = ("multiply_add", iv, iv, two, one)
-                reads, writes = vrange(iv) + vrange(two) + vrange(one), vrange(iv)
+                slot = ("multiply_add", iv, iv, two, bias_v)
+                reads, writes = vrange(iv) + vrange(two) + vrange(bias_v), vrange(iv)
             elif s == 15:
                 slot = ("+", iv, iv, xx)
                 reads, writes = vrange(iv) + vrange(xx), vrange(iv)
-            else:
-                mask = zero if group_round[g] == forest_height else all_ones
-                slot = ("&", iv, iv, mask)
-                reads, writes = vrange(iv) + vrange(mask), vrange(iv)
+            else:  # s == 16: wrap to root (absolute address fp)
+                slot = ("vbroadcast", iv, fp_s)
+                reads, writes = (fp_s,), vrange(iv)
             b.add("valu", slot, reads, writes)
 
-        # One gather every 4 cycles (8 loads, 2/cycle); hash chains of finished
-        # groups fill the valu slots in the same cycles.
+        # One gather every 4 cycles (8 loads, 2/cycle); root rounds skip loads;
+        # hash chains of other groups fill the valu slots in the same cycles.
         total_gathers = n_groups * rounds
         gather_seq = 0
         load_j = 0
@@ -258,7 +285,6 @@ class KernelBuilder:
         group_round = [0] * n_groups
         pending = []
         done = 0
-        b.add("valu", ("+", addr[0], idx_v[0], fp), vrange(idx_v[0]) + vrange(fp), vrange(addr[0]))
 
         while done < n_groups:
             for g in pending:
@@ -267,25 +293,38 @@ class KernelBuilder:
 
             if gather_seq < total_gathers:
                 g = gather_seq % n_groups
-                for jj in (0, 1):
-                    j = load_j + jj
-                    b.add("load", ("load", t[g] + j, addr[g] + j),
-                          (addr[g] + j,), (t[g] + j,))
-                load_j += 2
-                if load_j == VLEN:
-                    load_j = 0
+                rnd = gather_seq // n_groups
+                if rnd % (forest_height + 1) == 0:
+                    # All lanes sit at the root; node value is in root_v.
                     pending.append(g)
                     gather_seq += 1
-                    if gather_seq < total_gathers:
-                        ng = gather_seq % n_groups
-                        b.add("valu", ("+", addr[ng], idx_v[ng], fp),
-                              vrange(idx_v[ng]) + vrange(fp), vrange(addr[ng]))
+                elif rnd % (forest_height + 1) == 1:
+                    # idx in {1,2}: node = diff*addr + C.
+                    b.add("valu", ("multiply_add", t[g], idx_v[g], diff_v, C_v),
+                          vrange(idx_v[g]) + vrange(diff_v) + vrange(C_v),
+                          vrange(t[g]))
+                    pending.append(g)
+                    gather_seq += 1
+                else:
+                    for jj in (0, 1):
+                        j = load_j + jj
+                        b.add("load", ("load", t[g] + j, idx_v[g] + j),
+                              (idx_v[g] + j,), (t[g] + j,))
+                    load_j += 2
+                    if load_j == VLEN:
+                        load_j = 0
+                        pending.append(g)
+                        gather_seq += 1
 
             for gg in range(n_groups):
                 s = stage[gg]
                 if s >= 0:
-                    hash_op(gg, s)
-                    stage[gg] = s + 1
+                    rnd = group_round[gg]
+                    if s == 16 and rnd != forest_height:
+                        stage[gg] = 17  # wrap mask is a no-op off the leaf level
+                    else:
+                        hash_op(gg, s, rnd)
+                        stage[gg] = s + 1
                     if stage[gg] == 17:
                         stage[gg] = -1
                         group_round[gg] += 1
@@ -293,6 +332,9 @@ class KernelBuilder:
                             done += 1
 
         # Write the batch back out.
+        for g in range(n_groups):
+            b.add("valu", ("-", idx_v[g], idx_v[g], fp),
+                  vrange(idx_v[g]) + vrange(fp), vrange(idx_v[g]))
         for g in range(n_groups):
             b.add("load", ("const", maddr[g], idx_p + g * VLEN), (), (maddr[g],))
         for g in range(n_groups):

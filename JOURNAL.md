@@ -28,3 +28,14 @@ Append-only (ULTIMATE.md §8). Changed mind = new entry marking old superseded.
   `all_ones` normally, `zero` at forest_height (round 10). Verified: 2206 cycles correct.
 - Decision: instrumented slot counts — load 4306 (floor 2153 cyc), valu 9234 (floor
   1539 cyc), 2206 actual. Why: load-bound; must cut loads AND valu to beat 1363.
+- Decision: absolute addressing (idx_v = fp+logical) + root broadcast + D=2 linear
+  node selection. Why: removes ~508 loads and 513 addr-precompute valu ops.
+  Result: 2206 → 2043 cycles, correct. Slots: load 3286, valu 8371, flow 2.
+- Decision: D=4 node selection via 2-level `vselect` on flow engine was tried and
+  REVERTED. Why: flow is 1/cycle, so 3 serial vselects/group plus their dependency
+  flushes created ~700 extra valu-only bundles; 2180 cycles despite load floor
+  dropping to 1391. Lesson: flow-based selection trades load floor for scheduling
+  collapse; any load cut must stay valu/load-friendly.
+- Analysis: 17-op sequential hash chain × 512 chains / 6 valu = 1451 cyc hard floor;
+  1363 is below it. Reaching 1363 needs fewer hash ops per chain, fewer chains,
+  or a fundamentally different packing. Load floor 1643 also needs ≥600 loads cut.

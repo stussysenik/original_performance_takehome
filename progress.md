@@ -8,7 +8,7 @@ Source of truth for decisions is `JOURNAL.md`. Nothing load-bearing lives in cha
 - Goal: minimize simulated cycles in `KernelBuilder.build_kernel` (perf_takehome.py).
 - Target to beat: 1363 cycles (best-known bar, submission_tests.py:115).
 - Baseline: 147734 cycles.
-- Current best verified: **2206 cycles** (correctness confirmed on frozen simulator, 2026-11-19).
+- Current best verified: **2043 cycles** (correctness confirmed on frozen simulator, 2026-11-19).
 - Correctness oracle: final `inp_values` must match `reference_kernel2` on (10, 16, 256).
 - Hard rules: never edit `tests/`; `git diff origin/main tests/` must be empty.
 - Machine limits: alu 12, valu 6, load 2, store 2, flow 1; VLEN 8; SCRATCH 1536.
@@ -16,11 +16,19 @@ Source of truth for decisions is `JOURNAL.md`. Nothing load-bearing lives in cha
 - Current design: SIMD+VLIW software pipeline; one gather/4 iteration cycles;
   17-op hash chain per group per round overlapped across groups. `_Bundler`
   packs dependency-safe slots into cycles.
-- Measured slots: load 4306 (floor 2153 cyc), valu 9234 (floor 1539 cyc).
-  2206 actual ≈ load floor. Beating 1363 needs load ≤ 2726 AND valu ≤ 8178.
-- Cycle floor reasoning (open): 4096 scalar node loads dominate. Need broadcast
-  for rounds with few distinct indices (0/11 share idx 0) and removal of the
-  513 addr-precompute valu ops via absolute addressing.
+- Measured slots @2043: load 3286 (floor 1643 cyc), valu 8371 (floor 1395 cyc),
+  flow 2, store 64. 2043 actual ≈ load floor + ~400 valu-only bundles.
+  Beating 1363 needs load ≤ 2726 AND valu ≤ 8178 — neither holds yet.
+- Absolute addressing + D=2 linear node (rounds 1/12) + root broadcast (0/11)
+  landed: 2206 → 2043 cycles. idx_v holds fp+logical; gather addr = idx_v[j].
+- D=4 via vselect (rounds 2/13) REVERTED: 2180 cycles (worse). Flow engine is
+  1/cycle so 3 serial vselects/group + dependency flushes wreck valu packing.
+  Load floor dropped to 1391 but valu-only bundles dominated. Selection on flow
+  is the wrong tool here; need a load-side reduction that stays valu-friendly.
+- Cycle floor reasoning (open): 3072 gather loads across 12 rounds (32 groups
+  × 8 lanes). Eliminating D=4 alone → load 2774 (floor 1387, still >1363);
+  must also cut D=8. 17-op hash chain × 512 chains / 6 valu = 1451 cyc hard floor
+  unless the chain itself shrinks.
 
 ## Tasks
 
@@ -36,4 +44,7 @@ Source of truth for decisions is `JOURNAL.md`. Nothing load-bearing lives in cha
   2206 cycles correct (no cycle gain yet, load-bound). [done]
 - 2026-11-19 — optimize below 1363 cycles. [active]
 - 2026-11-19 — absolute addressing (remove 513 addr-precompute valu ops) and
-  root broadcast for rounds 0/11 (remove ~510 loads). [active]
+  root broadcast for rounds 0/11 (remove ~510 loads). 2206 → 2043. [done]
+- 2026-11-19 — D=2 linear node selection (rounds 1/12): 2043 confirmed. [done]
+- 2026-11-19 — D=4 vselect experiment: 2180 (regression), reverted. [done]
+- 2026-11-19 — optimize below 1363 (need load-side cut + shorter hash chain). [active]
