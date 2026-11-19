@@ -10,6 +10,9 @@ Source of truth for decisions is `JOURNAL.md`. Nothing load-bearing lives in cha
 - Baseline: 147734 cycles.
 - Current best verified: **2043 cycles** (correctness confirmed on frozen simulator, 2026-11-19).
 - Correctness oracle: final `inp_values` must match `reference_kernel2` on (10, 16, 256).
+- Full retrospective (cycle ladder, floor proof, process lessons, time estimate):
+  `JOURNAL.md` § "2026-11-19 — Retrospective: the road to 2043"; transferable
+  learnings in `LEARNING.md`.
 - Hard rules: never edit `tests/`; `git diff origin/main tests/` must be empty.
 - Machine limits: alu 12, valu 6, load 2, store 2, flow 1; VLEN 8; SCRATCH 1536.
 - n_nodes=2047, n_groups=32 (batch 256 / VLEN 8), rounds=16.

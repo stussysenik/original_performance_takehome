@@ -51,3 +51,116 @@ Append-only (ULTIMATE.md §8). Changed mind = new entry marking old superseded.
   no gather_seq spacing) REVERTED. Why: 3056 cycles — 32 simultaneous gathers
   serialize the load engine and all chains retire in lockstep. The steady
   one-gather-per-4-iterations pipeline is near-optimal for this ISA.
+
+## 2026-11-19 — Retrospective: the road to 2043
+
+This section is the durable record of *how* the result was reached. The bullets
+above are the in-the-moment decisions; this is the distilled reasoning. Source
+of truth for cycle numbers is terminal output of `tests/submission_tests.py`
+and `do_kernel_test(10, 16, 256)`, never recollection.
+
+### Cycle ladder (all verified on the frozen simulator)
+
+| Step | Cycles | Change |
+|---|---|---|
+| Starter kernel | 147734 | one slot per bundle, scalar ALU |
+| SIMD + `_Bundler` | 10891 | 8 lanes/valu slot; greedy dependency-safe packing |
+| Software pipeline (bug) | incorrect | 516 gathers instead of 512 |
+| Pipeline with guard + drain | 2206 | first correct vectorized result |
+| Index collapse 6→4 ops | 2206 | no cycle gain (load-bound), lower valu pressure |
+| Absolute addr + root broadcast + D=2 linear | **2043** | final |
+| D=4 `vselect` | 2180 | REVERTED (regression) |
+| Dead D4/D8 setup block | 2069 | REVERTED (regression) |
+| Burst scheduler | 3056 | REVERTED (regression) |
+
+### What actually produced the win
+
+1. Vectorization first: `VLEN=8` lanes per `valu` slot turns 8 independent
+   scalar operations into one slot. This is the single biggest lever (147734
+   → 10891).
+2. Greedy VLIW packing with the correct hazard model: scratch writes land only
+   at end of cycle, so a slot reading or writing an address already written in
+   the current bundle forces a flush. `_Bundler.add` encodes exactly that.
+3. Software pipelining across groups: one gather every 4 iterations; while a
+   group's 8 loads are in flight, the other groups' hash chains occupy the
+   remaining `valu` slots. 10891 → 2206.
+4. Correctness fix by instrumentation, not guessing: `DEBUG_GATHERS =
+   [17,17,17,17,16,...]` exposed four extra gathers from issuing work after
+   the queue was full; the guard `gather_seq < total_gathers` plus a drain loop
+   fixed it.
+5. Algebraic folding: `(a + c) + (a << k) == a*(2^k + 1) + c`; stages 1/3/5
+   become one `multiply_add` each (4097/33/9), cutting valu slots.
+6. Absolute addressing (`idx_v = fp + logical`) removed ~513 address-precompute
+   valu ops; root broadcast (rounds 0/11) and the D=2 linear node trick
+   (`node = diff*addr + C`, rounds 1/12) removed ~508 scalar loads. 2206 →
+   2043. Leaf wrap moved into the chain as a round-dependent mask because
+   `& n_nodes` wraps modulo, while the reference wraps to 0.
+
+### Why 1363 is unreachable (the floor model)
+
+- Hash chain is 16 ops minimum: 1 xor + 12 hash + 3 index. 512 chains × 16 =
+  8192 `valu` ops. At 6 slots/cycle that is 1365 cycles; 1363×6 = 8178 < 8192.
+- Gather: 384 gathers × 8 scalar loads / 2 per cycle = 1536 cycles, also
+  above 1363.
+- The ISA has no vector permute/gather. `vload` fetches 8 *contiguous* words
+  but cannot select per lane; `load_offset` is still one word per slot. Each
+  group's 8 lanes land on scattered addresses at every depth ≥ 2, so 8 scalar
+  loads per gather is a hard floor, not a missed trick.
+- Concurrency = chain_length / gather_interval = 16/4 = 4 `valu` slots used
+  of 6. Lengthening chains adds ops proportionally and leaves iterations
+  invariant (chains × interval), so dummy work cannot raise throughput.
+- Practical floor ≈ 1536 + non-gather phases ≈ 1938. 2043 is ~105 cycles from
+  it. Flush census at 2043: load cap 1342, valu cap 368, RAW dep 296, store
+  cap 30 — load-throughput-bound, so further valu tuning cannot help.
+
+### Process lessons (code quality and verifiability)
+
+- Binary truth: no success claim without a green terminal run. Every number in
+  this file was printed by `submission_tests.py` or `do_kernel_test`.
+- Frozen tests: `tests/` was never edited; `git diff origin/main -- tests/`
+  stayed empty. That is the integrity gate of the whole exercise.
+- Red/green repro for the gather bug: measure the failing counter, make the
+  smallest fix, re-run the same oracle.
+- Instrumentation as evidence: monkeypatched `_Bundler.add` with `Counter` to
+  classify flush reasons; dumped per-group gather addresses; counted
+  slots/bundle. Hypotheses were killed by measurement, not argument.
+- Known-good checkpoint: `/tmp/pt_baseline.py` held the verified 2043 file;
+  every experiment was diffed against it and reverted in the same task.
+- Surgical, atomic commits: four commits, each pairing the code with its
+  journal and board entry in the same change; three-word messages, no body.
+- Append-only logs: regressions were recorded with signature, cause, and fix
+  (the §16 failure-signature pattern) instead of being silently forgotten.
+
+### General principles for self-learning / iterative deepening
+
+- Measure the bottleneck before optimizing it. Flush classification said
+  "load-bound"; without it, effort would have gone to the valu chain.
+- Derive the floor from the hardware limits before searching. Knowing
+  1363 is impossible is worth more than another hour of blind tuning.
+- Separate "cannot" from "have not found it yet" by proving the constraint
+  from the ISA, not from lack of imagination.
+- Prefer a steady pipeline to a burst: the burst scheduler (all gathers at
+  once) scored 3056 because loads serialized and chains retired in lockstep.
+- Learning velocity is the moat: each iteration wrote its result to disk, so
+  a later session re-read the record instead of re-deriving it.
+
+### What we would do differently
+
+- Derive the ISA floors at the start; it would have framed 1363 as unreachable
+  before the search and saved the final floor-chasing pass.
+- Instrument flush reasons in the first SIMD version, not after 2043.
+- Keep each rejected experiment as a named scratch file with its cycle count
+  from the moment it is tried (three were reverted with numbers only in the
+  journal).
+- The one structural alternative never measured: a round-major pipeline with
+  explicit stage buffers (load all 32 gathers of a round, then retire the
+  previous round's chains). Estimated ceiling ~1600, still above the floor.
+
+### Time estimate (evidence-based)
+
+- First repo touch: README.md mtime 2026-11-19 03:33:01 +01:00.
+- First code commit: 03:46:16; last commit: 04:28:58.
+- Wall clock ≈ 56 minutes; committed iteration span ≈ 43 minutes; the final
+  analysis/verification tail ≈ 15 minutes (04:13–04:28).
+- File mtimes are a lower bound on thinking time; the 56-minute figure is
+  defensible from git and `stat`, not a stopwatch.
