@@ -21,3 +21,10 @@ Append-only (ULTIMATE.md §8). Changed mind = new entry marking old superseded.
   Verified: 2206 cycles, correct on frozen simulator.
 - Decision: keep tests/ byte-identical; validate with `python tests/submission_tests.py`
   and `git diff origin/main tests/`. Why: README warns LLM test-editing is cheating.
+- Decision: collapse index update from 6 to 4 ops (fuse `2*idx+1` into multiply_add,
+  parity into +, wrap into mask). Why: fewer valu slots for when load floor breaks.
+- Root cause (correctness bug): `& n_nodes` wraps modulo, but reference wraps to 0.
+  Evidence: AssertionError on round 1 with mask. Fix: round-dependent mask —
+  `all_ones` normally, `zero` at forest_height (round 10). Verified: 2206 cycles correct.
+- Decision: instrumented slot counts — load 4306 (floor 2153 cyc), valu 9234 (floor
+  1539 cyc), 2206 actual. Why: load-bound; must cut loads AND valu to beat 1363.

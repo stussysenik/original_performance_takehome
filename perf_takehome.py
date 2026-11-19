@@ -154,7 +154,10 @@ class KernelBuilder:
             return v
 
         one = const_vec(1, "one")
+        two = const_vec(2, "two")
         nn = const_vec(n_nodes, "nn")
+        all_ones = const_vec(0xFFFFFFFF, "all_ones")
+        zero = const_vec(0, "zero")
         fp = const_vec(forest_p, "fp")
         m1 = const_vec(4097, "m1")
         m3 = const_vec(33, "m3")
@@ -232,23 +235,18 @@ class KernelBuilder:
                 slot = ("^", vv, xx, c6)
                 reads, writes = vrange(xx) + vrange(c6), vrange(vv)
             elif s == 13:
-                slot = ("&", tt, vv, one)
-                reads, writes = vrange(vv) + vrange(one), vrange(tt)
+                slot = ("&", xx, vv, one)
+                reads, writes = vrange(vv) + vrange(one), vrange(xx)
             elif s == 14:
-                slot = ("<<", xx, iv, one)
-                reads, writes = vrange(iv) + vrange(one), vrange(xx)
+                slot = ("multiply_add", iv, iv, two, one)
+                reads, writes = vrange(iv) + vrange(two) + vrange(one), vrange(iv)
             elif s == 15:
-                slot = ("+", xx, xx, tt)
-                reads, writes = vrange(xx) + vrange(tt), vrange(xx)
-            elif s == 16:
-                slot = ("+", iv, xx, one)
-                reads, writes = vrange(xx) + vrange(one), vrange(iv)
-            elif s == 17:
-                slot = ("<", tt, iv, nn)
-                reads, writes = vrange(iv) + vrange(nn), vrange(tt)
+                slot = ("+", iv, iv, xx)
+                reads, writes = vrange(iv) + vrange(xx), vrange(iv)
             else:
-                slot = ("*", iv, iv, tt)
-                reads, writes = vrange(iv) + vrange(tt), vrange(iv)
+                mask = zero if group_round[g] == forest_height else all_ones
+                slot = ("&", iv, iv, mask)
+                reads, writes = vrange(iv) + vrange(mask), vrange(iv)
             b.add("valu", slot, reads, writes)
 
         # One gather every 4 cycles (8 loads, 2/cycle); hash chains of finished
@@ -288,7 +286,7 @@ class KernelBuilder:
                 if s >= 0:
                     hash_op(gg, s)
                     stage[gg] = s + 1
-                    if stage[gg] == 19:
+                    if stage[gg] == 17:
                         stage[gg] = -1
                         group_round[gg] += 1
                         if group_round[gg] == rounds:
