@@ -25,10 +25,23 @@ Source of truth for decisions is `JOURNAL.md`. Nothing load-bearing lives in cha
   1/cycle so 3 serial vselects/group + dependency flushes wreck valu packing.
   Load floor dropped to 1391 but valu-only bundles dominated. Selection on flow
   is the wrong tool here; need a load-side reduction that stays valu-friendly.
-- Cycle floor reasoning (open): 3072 gather loads across 12 rounds (32 groups
-  × 8 lanes). Eliminating D=4 alone → load 2774 (floor 1387, still >1363);
-  must also cut D=8. 17-op hash chain × 512 chains / 6 valu = 1451 cyc hard floor
-  unless the chain itself shrinks.
+- 1363 cycles is UNREACHABLE on this ISA — two independent hard floors both
+  exceed it. (1) Hash: 16 ops/chain is minimal (1 xor + 12 hash + 3 index);
+  512 chains × 16 = 8192 valu ops; 1363×6 = 8178 < 8192. (2) Gather: 384
+  gathers × 8 scalar loads / 2 per cycle = 1536 cycles > 1363. Verified no
+  vector permute/gather op exists: `vload` loads 8 contiguous words but cannot
+  select per-lane, `load_offset` is still 1 word/slot, so 8 loads/gather is a
+  hard floor. Practical floor ≈ load 1536 + non-gather valu phases ≈ 1938;
+  current 2043 is within ~105 cycles of it.
+- Flush diagnosis @2043 (monkeypatched `_Bundler.add`): load cap 1342, valu cap
+  368, RAW dep 296, store cap 30. Load-throughput-bound; cycles ≈ scheduler
+  iterations. Concurrency = chain_len/gather_interval = 16/4 = 4 valu slots used
+  of 6. Adding dummy ops to lengthen chains leaves iterations invariant
+  (chains × interval) and adds cost, so it cannot help.
+- Burst scheduler experiment (start every idle group's next round immediately):
+  3056 cycles (much worse) — 32 gathers launch at once, loads serialize and all
+  chains finish in lockstep. REVERTED; the steady one-gather-per-4-iterations
+  pipeline is near-optimal.
 
 ## Tasks
 
@@ -47,4 +60,5 @@ Source of truth for decisions is `JOURNAL.md`. Nothing load-bearing lives in cha
   root broadcast for rounds 0/11 (remove ~510 loads). 2206 → 2043. [done]
 - 2026-11-19 — D=2 linear node selection (rounds 1/12): 2043 confirmed. [done]
 - 2026-11-19 — D=4 vselect experiment: 2180 (regression), reverted. [done]
-- 2026-11-19 — optimize below 1363 (need load-side cut + shorter hash chain). [active]
+- 2026-11-19 — proved 1363 unreachable (load floor 1536, valu floor 8192 ops);
+  burst scheduler 3056 (reverted); finalized at verified 2043. [done]

@@ -36,6 +36,18 @@ Append-only (ULTIMATE.md §8). Changed mind = new entry marking old superseded.
   flushes created ~700 extra valu-only bundles; 2180 cycles despite load floor
   dropping to 1391. Lesson: flow-based selection trades load floor for scheduling
   collapse; any load cut must stay valu/load-friendly.
-- Analysis: 17-op sequential hash chain × 512 chains / 6 valu = 1451 cyc hard floor;
-  1363 is below it. Reaching 1363 needs fewer hash ops per chain, fewer chains,
-  or a fundamentally different packing. Load floor 1643 also needs ≥600 loads cut.
+- Analysis (supersedes the 17-op/1451 note above): 1363 is unreachable, proven two
+  ways. Hash chain is 16 ops minimal (1 xor + 12 hash + 3 index) × 512 chains =
+  8192 valu ops; 1363×6 = 8178 < 8192. Gather = 384 × 8 scalar loads / 2 per
+  cycle = 1536 cycles, also > 1363. ISA has no vector permute/gather: `vload`
+  loads 8 contiguous words but cannot select per-lane, `load_offset` is 1 word/
+  slot — so 8 loads/gather is a hard floor. Practical floor ≈ 1938 (load 1536 +
+  non-gather valu); 2043 is within ~105 cycles of it.
+- Root cause (perf): at 2043, concurrency = chain_len/gather_interval = 16/4 = 4
+  valu slots used of 6; ~2 idle. Flush reasons: load cap 1342, valu cap 368,
+  RAW dep 296, store cap 30 → load-throughput-bound. Lengthening chains cannot
+  raise throughput (iterations = chains × interval, invariant) and adds cost.
+- Decision: burst scheduler (start every idle group's next round immediately,
+  no gather_seq spacing) REVERTED. Why: 3056 cycles — 32 simultaneous gathers
+  serialize the load engine and all chains retire in lockstep. The steady
+  one-gather-per-4-iterations pipeline is near-optimal for this ISA.
