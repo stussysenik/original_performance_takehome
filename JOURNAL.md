@@ -164,3 +164,66 @@ and `do_kernel_test(10, 16, 256)`, never recollection.
   analysis/verification tail ≈ 15 minutes (04:13–04:28).
 - File mtimes are a lower bound on thinking time; the 56-minute figure is
   defensible from git and `stat`, not a stopwatch.
+
+## 2026-11-19 — Mining the experience: a reusable method
+
+The retrospective records *what* happened. This section records the
+*transferable method* — the parts that improve the next piece of code, not
+just this kernel. Every number below came from a verified run, not memory.
+
+### The method (five moves, in order)
+
+1. Read the machine first. Before writing code, list the hardware limits
+   (`SLOT_LIMITS`, ISA ops, ports) and derive the theoretical floor. That turns
+   a vague target into a yes/no feasibility question.
+2. Measure the bottleneck, then optimize exactly it. A flush census
+   (monkeypatch `add`, `Counter`) said load-bound 1342 vs valu 368; valu tuning
+   could not have helped. Spend effort on the measured constraint only.
+3. Build in verified increments. One change, one checkpoint, one oracle. Keep
+   a known-good file (`/tmp/pt_baseline.py`), diff every experiment against it,
+   revert in the same task. Terminal output is the only claim.
+4. Distill, then stop. Fold algebra, remove precompute, and stop at the floor
+   where the next removal costs correctness or a named guarantee.
+5. Persist on disk. Append-only LEARNING.md plus §16 failure signatures, so the
+   next session re-reads instead of re-deriving. Each commit pairs code with
+   its journal and board entry in the same change.
+
+### Rules that generalize past this kernel
+
+- Correctness semantics beat cleverness: `& n_nodes` wraps modulo, the
+  reference wraps to 0 — the trap was semantic, not arithmetic.
+- Steady pipelines beat bursts whenever a resource serializes; throughput of
+  independent chains = chain_length / interval, invariant to dummy ops.
+- "Cannot" and "haven't found it" are different states; separate them by
+  proving the constraint from the ISA, not from a lack of ideas.
+- Every rejected experiment gets a number and a named scratch file; the record
+  of a wrong turn is worth more than the turn itself.
+- Terminal output, `git diff origin/main -- tests/`, and `ls-remote` are proof;
+  silence from a push or an edit is not.
+
+### Proposed ULTIMATE.md §19 (pending owner yes — not applied)
+
+Governance §12 requires an exact diff and approval for edits beyond index rows.
+Proposed insertion after §17 (currently line 707), before the footer:
+
+```markdown
+## 19. Performance & code-quality method — ↔ this-experience (anthropic kernel, 2026-11-19)
+
+- **Read the machine first.** List hardware limits (`SLOT_LIMITS`, ISA ops,
+  ports) and derive the theoretical floor before writing code. A target below
+  the floor is unreachable — stop searching instead of blaming imagination.
+- **Match the algorithm to the machine.** The dominant win is structural
+  (vectorize to the slot width, pipeline independent chains), not micro-tuning.
+  Without a vector permute, scattered per-lane loads are a hard bandwidth floor.
+- **Measure the bottleneck, then optimize exactly it.** Classify stalls with a
+  monkeypatch + `Counter` (this work: load 1342 vs valu 368 flushes); effort on
+  any other constraint is wasted.
+- **Steady pipeline beats burst.** Throughput of independent chains =
+  chain_length / start_interval; dummy ops leave iterations invariant. All-at-
+  once gathers serialize the load engine.
+- **Verified increments + exact reverts.** One change, one oracle, one known-
+  good checkpoint; diff every experiment against it and revert in the same task.
+- **Persist learning on disk.** Append-only LEARNING.md and §16 rows so the next
+  session re-reads instead of re-deriving; each commit pairs code with its
+  journal and board entry in the same change.
+```

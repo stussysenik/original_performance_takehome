@@ -21,3 +21,8 @@ not decisions (JOURNAL.md) and not agent-correction memory (tasks/lessons.md).
 - 2026-11-19 — `git diff origin/main -- tests/` and `git ls-remote origin refs/heads/main` are proof, not paranoia: silence from a push or an edit is not evidence.
 - 2026-11-19 — Keeping a known-good file at `/tmp/pt_baseline.py` and diffing against it after every experiment makes reverts exact and cheap.
 - 2026-11-19 — Terminal output is the only correctness oracle; never claim a cycle count or a clean tree from memory.
+- 2026-11-19 — The dominant win is structural: match the algorithm to the machine (slot width, SIMD lanes) before folding constants; algorithm-hardware fit dwarfs micro-tuning.
+- 2026-11-19 — A parallel/VLIW scheduler needs an explicit end-of-cycle visibility hazard model; without it results corrupt silently while tests can still pass.
+- 2026-11-19 — Name every rejected experiment with its measurement in a scratch file; a reverted idea with a number is a learning, a silent revert is waste.
+- 2026-11-19 — Distillation is a second loss function: correctness first, size second; stop where removing a concept costs correctness or a named guarantee.
+- 2026-11-19 — One concern per commit, paired with its journal and board entry in the same change; the decision record lives once, not in prose comments.
